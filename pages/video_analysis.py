@@ -10,7 +10,7 @@ from utils.video_processor import process_face_video, load_physformer_model
 from utils.pdf_report import generate_vital_signs_report
 
 
-def render_vital_signs():
+def render_video_analysis():
     # Pre-warm model in background singleton cache so analyze is instantaneous
     try:
         load_physformer_model()

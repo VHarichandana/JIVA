@@ -97,8 +97,8 @@ elif current == "X-ray Analysis":
     from pages.xray_analysis import render_xray_analysis
     render_xray_analysis()
 elif current == "Video Analysis":
-    from pages.video_analysis import render_vital_signs
-    render_vital_signs()
+    from pages.video_analysis import render_video_analysis
+    render_video_analysis()
 elif current == "Performance":
     from pages.model_performance import render_model_performance
     render_model_performance()
