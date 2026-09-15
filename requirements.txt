@@ -18,3 +18,5 @@ accelerate>=0.28.0
 huggingface_hub>=0.21.0
 SpeechRecognition>=3.10.0
 opencv-python-headless==4.13.0.92
+streamlit-webrtc==0.74.1
+av>=15.1.0
