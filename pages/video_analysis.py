@@ -1,14 +1,168 @@
 import os
 import time
+import uuid
+import threading
+
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
+
+from streamlit_webrtc import (
+    webrtc_streamer,
+    WebRtcMode,
+    VideoProcessorBase
+)
 
 from utils.video_processor import (
     process_face_video,
     load_physformer_model
 )
 from utils.pdf_report import generate_vital_signs_report
+
+
+class JIVABrowserRecorder(VideoProcessorBase):
+    def __init__(
+        self,
+        output_path,
+        target_frames=160,
+        fps=30.0
+    ):
+        self.output_path = output_path
+        self.target_frames = int(target_frames)
+        self.fps = float(fps)
+
+        root, ext = os.path.splitext(output_path)
+        if not ext:
+            ext = ".mp4"
+
+        self.temp_path = f"{root}_tmp{ext}"
+
+        self.lock = threading.Lock()
+        self.writer = None
+        self.frame_count = 0
+        self.completed = False
+        self.error = None
+
+        os.makedirs(
+            os.path.dirname(self.output_path) or ".",
+            exist_ok=True
+        )
+
+        for path in (
+            self.output_path,
+            self.temp_path
+        ):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+
+    def _open_writer(self, image):
+        height, width = image.shape[:2]
+
+        fourcc = cv2.VideoWriter_fourcc(
+            *"mp4v"
+        )
+
+        writer = cv2.VideoWriter(
+            self.temp_path,
+            fourcc,
+            self.fps,
+            (width, height)
+        )
+
+        if not writer.isOpened():
+            raise RuntimeError(
+                "Could not create the temporary "
+                "browser camera video file."
+            )
+
+        self.writer = writer
+
+    def recv(self, frame):
+        image = frame.to_ndarray(
+            format="bgr24"
+        )
+
+        with self.lock:
+            if (
+                self.completed
+                or self.error is not None
+            ):
+                return frame
+
+            try:
+                if self.writer is None:
+                    self._open_writer(
+                        image
+                    )
+
+                self.writer.write(
+                    image
+                )
+
+                self.frame_count += 1
+
+                if (
+                    self.frame_count
+                    >= self.target_frames
+                ):
+                    self.writer.release()
+                    self.writer = None
+
+                    os.replace(
+                        self.temp_path,
+                        self.output_path
+                    )
+
+                    self.completed = True
+
+            except Exception as exc:
+                self.error = str(exc)
+
+                if self.writer is not None:
+                    try:
+                        self.writer.release()
+                    except Exception:
+                        pass
+
+                    self.writer = None
+
+        return frame
+
+    def get_status(self):
+        with self.lock:
+            return {
+                "frame_count": self.frame_count,
+                "target_frames": self.target_frames,
+                "completed": self.completed,
+                "error": self.error
+            }
+
+    def on_ended(self):
+        with self.lock:
+            if self.writer is not None:
+                try:
+                    self.writer.release()
+                except Exception:
+                    pass
+
+                self.writer = None
+
+            if (
+                not self.completed
+                and os.path.exists(
+                    self.temp_path
+                )
+            ):
+                try:
+                    os.remove(
+                        self.temp_path
+                    )
+                except OSError:
+                    pass
 
 
 def render_video_analysis():
@@ -505,10 +659,10 @@ def render_video_analysis():
                     </div>
 
                     <div class="vital-text">
-                        Sit in front of your webcam with clear,
-                        even facial lighting. The camera will
-                        record approximately 160 frames for
-                        PhysFormer rPPG analysis.
+                        The deployed app uses your browser camera.
+                        Keep your face centered with steady lighting.
+                        JIVA captures the first 160 frames and saves
+                        them for the existing PhysFormer pipeline.
                     </div>
 
                 </div>
@@ -526,6 +680,56 @@ def render_video_analysis():
             )
 
 
+            if (
+                "camera_capture_id"
+                not in st.session_state
+            ):
+                st.session_state[
+                    "camera_capture_id"
+                ] = uuid.uuid4().hex
+
+
+            if (
+                "camera_recording_active"
+                not in st.session_state
+            ):
+                st.session_state[
+                    "camera_recording_active"
+                ] = False
+
+
+            camera_capture_id = (
+                st.session_state[
+                    "camera_capture_id"
+                ]
+            )
+
+            camera_output_path = os.path.join(
+                "scratch",
+                (
+                    "recorded_camera_video_"
+                    f"{camera_capture_id}.mp4"
+                )
+            )
+
+
+            existing_recorded_path = (
+                st.session_state.get(
+                    "recorded_video_path"
+                )
+            )
+
+            if (
+                existing_recorded_path
+                and os.path.exists(
+                    existing_recorded_path
+                )
+            ):
+                recorded_path = (
+                    existing_recorded_path
+                )
+
+
             col_rc1, col_rc2 = st.columns(
                 [1.5, 1.0]
             )
@@ -533,23 +737,73 @@ def render_video_analysis():
 
             with col_rc1:
 
-                start_rec_clicked = st.button(
-                    "🔴 Record 5-Second Video",
-                    type="primary",
-                    width="stretch",
-                    key="btn_start_camera_rec"
-                )
+                if not st.session_state[
+                    "camera_recording_active"
+                ]:
+
+                    if st.button(
+                        "🔴 Record 5-Second Video",
+                        type="primary",
+                        width="stretch",
+                        key="btn_start_camera_rec"
+                    ):
+
+                        previous_path = (
+                            st.session_state.get(
+                                "recorded_video_path"
+                            )
+                        )
+
+                        if (
+                            previous_path
+                            and os.path.exists(
+                                previous_path
+                            )
+                        ):
+                            try:
+                                os.remove(
+                                    previous_path
+                                )
+                            except OSError:
+                                pass
+
+                        st.session_state.pop(
+                            "recorded_video_path",
+                            None
+                        )
+
+                        st.session_state.pop(
+                            "auto_analyze_triggered",
+                            None
+                        )
+
+                        st.session_state[
+                            "camera_capture_id"
+                        ] = uuid.uuid4().hex
+
+                        st.session_state[
+                            "camera_recording_active"
+                        ] = True
+
+                        st.rerun()
+
+                else:
+
+                    st.button(
+                        "● Recording...",
+                        type="primary",
+                        width="stretch",
+                        disabled=True,
+                        key="btn_camera_recording_busy"
+                    )
 
 
             with col_rc2:
 
                 if (
-                    "recorded_video_path"
-                    in st.session_state
+                    recorded_path
                     and os.path.exists(
-                        st.session_state[
-                            "recorded_video_path"
-                        ]
+                        recorded_path
                     )
                 ):
 
@@ -559,155 +813,54 @@ def render_video_analysis():
                         key="btn_clear_rec"
                     ):
 
+                        try:
+                            os.remove(
+                                recorded_path
+                            )
+                        except OSError:
+                            pass
+
                         st.session_state.pop(
                             "recorded_video_path",
                             None
                         )
 
+                        st.session_state.pop(
+                            "auto_analyze_triggered",
+                            None
+                        )
+
+                        st.session_state[
+                            "camera_recording_active"
+                        ] = False
+
+                        st.session_state[
+                            "camera_capture_id"
+                        ] = uuid.uuid4().hex
+
                         st.rerun()
 
 
-            if start_rec_clicked:
-
-                from utils.video_processor import (
-                    record_webcam_video
+            if (
+                st.session_state[
+                    "camera_recording_active"
+                ]
+            ):
+                st.info(
+                    "Allow camera access in your browser. "
+                    "Recording starts automatically and "
+                    "stops after 160 frames are captured."
                 )
 
-
-                with col_preview:
-
-                    live_feed_box = st.empty()
-                    rec_badge = st.empty()
-                    rec_bar = st.progress(0)
-
-
-                def on_webcam_frame(
-                    curr,
-                    total,
-                    rgb_frame
-                ):
-
-                    pct = curr / total
-
-                    rec_bar.progress(
-                        pct
-                    )
-
-                    rec_badge.html(
-                        f"""
-                        <div style="
-                            background:#FEE2E2;
-                            border:1px solid #FCA5A5;
-                            color:#B91C1C;
-                            font-weight:700;
-                            padding:6px 12px;
-                            border-radius:8px;
-                            font-size:0.88rem;
-                            margin-bottom:8px;
-                        ">
-                            ● RECORDING:
-                            Frame {curr}/{total}
-                            ({int(pct * 100)}%)
-                            — Look at camera and remain still
-                        </div>
-                        """
-                    )
-
-                    live_feed_box.image(
-                        rgb_frame,
-                        width="stretch"
-                    )
-
-
-                try:
-
-                    out_vid, total_f, fps_cam = (
-                        record_webcam_video(
-                            output_path=(
-                                "scratch/"
-                                "recorded_camera_video.mp4"
-                            ),
-                            target_frames=160,
-                            frame_callback=on_webcam_frame
-                        )
-                    )
-
-
-                    st.session_state[
-                        "recorded_video_path"
-                    ] = out_vid
-
-
-                    fps_cam_text = (
-                        f"{float(fps_cam):.1f}"
-                    )
-
-
-                    rec_badge.html(
-                        f"""
-                        <div style="
-                            background:#ECFDF5;
-                            border:1px solid #A7F3D0;
-                            color:#047857;
-                            font-weight:700;
-                            padding:6px 12px;
-                            border-radius:8px;
-                            font-size:0.88rem;
-                            margin-bottom:8px;
-                        ">
-                            Recording complete.
-                            Captured {total_f} frames
-                            at {fps_cam_text} fps.
-                        </div>
-                        """
-                    )
-
-
-                    rec_bar.empty()
-
-                    time.sleep(0.5)
-
-
-                    if auto_analyze:
-
-                        st.session_state[
-                            "auto_analyze_triggered"
-                        ] = True
-
-
-                    st.rerun()
-
-
-                except Exception as cam_err:
-
-                    rec_bar.empty()
-                    rec_badge.empty()
-
-                    st.error(
-                        f"Camera Recording Error: {cam_err}"
-                    )
-
-
-            if (
-                "recorded_video_path"
-                in st.session_state
+            elif (
+                recorded_path
                 and os.path.exists(
-                    st.session_state[
-                        "recorded_video_path"
-                    ]
+                    recorded_path
                 )
             ):
-
-                recorded_path = (
-                    st.session_state[
-                        "recorded_video_path"
-                    ]
-                )
-
                 st.success(
                     "Camera clip ready."
                 )
-
 
         # =====================================================
         # BENCHMARK VIDEO
@@ -940,17 +1093,267 @@ def render_video_analysis():
         elif (
             input_choice
             == "Record Live Video with Camera 📹"
-            and recorded_path
-            and os.path.exists(recorded_path)
         ):
 
-            with open(
-                recorded_path,
-                "rb"
-            ) as video_file:
+            if st.session_state.get(
+                "camera_recording_active",
+                False
+            ):
 
-                st.video(
-                    video_file.read()
+                camera_capture_id = (
+                    st.session_state[
+                        "camera_capture_id"
+                    ]
+                )
+
+                camera_output_path = (
+                    os.path.join(
+                        "scratch",
+                        (
+                            "recorded_camera_video_"
+                            f"{camera_capture_id}.mp4"
+                        )
+                    )
+                )
+
+
+                def recorder_factory(
+                    output_path=camera_output_path
+                ):
+                    return JIVABrowserRecorder(
+                        output_path=output_path,
+                        target_frames=160,
+                        fps=30.0
+                    )
+
+
+                webrtc_ctx = webrtc_streamer(
+                    key=(
+                        "jiva-browser-camera-"
+                        f"{camera_capture_id}"
+                    ),
+                    mode=WebRtcMode.SENDRECV,
+                    desired_playing_state=True,
+                    video_processor_factory=(
+                        recorder_factory
+                    ),
+                    media_stream_constraints={
+                        "video": {
+                            "width": {
+                                "ideal": 640
+                            },
+                            "height": {
+                                "ideal": 480
+                            },
+                            "frameRate": {
+                                "ideal": 30
+                            }
+                        },
+                        "audio": False
+                    },
+                    rtc_configuration={
+                        "iceServers": [
+                            {
+                                "urls": [
+                                    (
+                                        "stun:"
+                                        "stun.l.google.com:"
+                                        "19302"
+                                    )
+                                ]
+                            }
+                        ]
+                    },
+                    async_processing=True,
+                    media_toggle_controls=False
+                )
+
+
+                if webrtc_ctx.state.playing:
+
+                    rec_bar = st.progress(
+                        0
+                    )
+
+                    rec_status = st.empty()
+
+                    timeout_at = (
+                        time.time()
+                        + 20.0
+                    )
+
+
+                    while (
+                        webrtc_ctx.state.playing
+                        and time.time()
+                        < timeout_at
+                    ):
+
+                        processor = (
+                            webrtc_ctx.video_processor
+                        )
+
+                        if processor is None:
+                            time.sleep(
+                                0.1
+                            )
+                            continue
+
+
+                        status = (
+                            processor.get_status()
+                        )
+
+                        frame_count = int(
+                            status.get(
+                                "frame_count",
+                                0
+                            )
+                        )
+
+                        target_frames = int(
+                            status.get(
+                                "target_frames",
+                                160
+                            )
+                        )
+
+
+                        rec_bar.progress(
+                            min(
+                                frame_count
+                                / max(
+                                    target_frames,
+                                    1
+                                ),
+                                1.0
+                            )
+                        )
+
+                        rec_status.markdown(
+                            (
+                                "**Recording:** "
+                                f"{frame_count}/"
+                                f"{target_frames} frames"
+                            )
+                        )
+
+
+                        if status.get(
+                            "error"
+                        ):
+
+                            st.session_state[
+                                "camera_recording_active"
+                            ] = False
+
+                            rec_bar.empty()
+                            rec_status.empty()
+
+                            st.error(
+                                "Browser camera recording "
+                                "failed: "
+                                f"{status['error']}"
+                            )
+
+                            st.rerun()
+
+
+                        if status.get(
+                            "completed"
+                        ):
+
+                            st.session_state[
+                                "recorded_video_path"
+                            ] = camera_output_path
+
+                            st.session_state[
+                                "camera_recording_active"
+                            ] = False
+
+                            if auto_analyze:
+                                st.session_state[
+                                    "auto_analyze_triggered"
+                                ] = True
+
+                            rec_bar.progress(
+                                1.0
+                            )
+
+                            rec_status.success(
+                                "160 frames captured."
+                            )
+
+                            time.sleep(
+                                0.4
+                            )
+
+                            st.rerun()
+
+
+                        time.sleep(
+                            0.1
+                        )
+
+
+                    if (
+                        time.time()
+                        >= timeout_at
+                        and st.session_state.get(
+                            "camera_recording_active",
+                            False
+                        )
+                    ):
+
+                        st.session_state[
+                            "camera_recording_active"
+                        ] = False
+
+                        rec_bar.empty()
+                        rec_status.empty()
+
+                        st.warning(
+                            "Camera capture timed out. "
+                            "Please try recording again."
+                        )
+
+                        st.rerun()
+
+
+            elif (
+                recorded_path
+                and os.path.exists(
+                    recorded_path
+                )
+            ):
+
+                with open(
+                    recorded_path,
+                    "rb"
+                ) as video_file:
+
+                    st.video(
+                        video_file.read()
+                    )
+
+
+            else:
+
+                st.html(
+                    """
+                    <div class="video-preview-box">
+
+                        <div class="video-preview-title">
+                            Browser Camera Preview
+                        </div>
+
+                        <div class="video-preview-box-sub">
+                            Click Record 5-Second Video,
+                            then allow camera access.
+                        </div>
+
+                    </div>
+                    """
                 )
 
 
